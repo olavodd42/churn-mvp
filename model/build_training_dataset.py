@@ -203,7 +203,9 @@ if "label" not in full_df.columns:
         source_for_orders = "num_orders_30d"
 
     if source_for_orders:
-        full_df["label"] = (full_df[source_for_orders].fillna(0) == 0).astype(int)
+        full_df["label"] = (
+            (full_df["days_since_last_order"] > 60)  # sem compra há mais de 60 dias
+        ).astype(int)
     else:
         # fallback conservador: marca tudo como não-churn (0) para evitar vazamento
         full_df["label"] = 0

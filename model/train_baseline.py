@@ -15,6 +15,7 @@ import pandas as pd
 import joblib
 from sklearn.metrics import roc_auc_score, accuracy_score, classification_report, confusion_matrix
 import lightgbm as lgb
+from sklearn.preprocessing import RobustScaler
 
 RANDOM_STATE = 42
 
@@ -133,16 +134,49 @@ for c in selected_features:
 X_train = X_train.astype(float)
 X_val = X_val.astype(float)
 
+# --- Remove colunas com variância baixa (quase tudo zero) ---
+low_var = [c for c in selected_features
+           if (X_train[c].std() < 1e-6) or ((X_train[c]==0).mean() > 0.9)]
+if low_var:
+    print("Dropping low-variance features:", low_var)
+    for c in low_var:
+        selected_features.remove(c)
+        X_train.drop(columns=[c], inplace=True, errors=True)
+        X_val.drop(columns=[c], inplace=True, errors=True)
+
 print("Final feature set:", selected_features)
 print("X_train shape:", X_train.shape, "X_val shape:", X_val.shape)
 print("Label distribution (train):\n", y_train.value_counts())
 print("Label distribution (val):\n", y_val.value_counts())
 
+
+scaler = RobustScaler()
+X_train.loc[:, :] = scaler.fit_transform(X_train)
+X_val.loc[:, :] = scaler.transform(X_val)
 # ------------- handle class imbalance -------------
 pos = int(y_train.sum())
 neg = int(len(y_train) - pos)
 scale_pos_weight = (neg / (pos + 1e-9)) if pos > 0 else 1.0
 print("scale_pos_weight:", scale_pos_weight)
+
+# --- Remover features que reproduzem o label (vazamento) ---
+leaky = []
+for c in selected_features.copy():
+    # compara ranges — se max_neg < min_pos ou max_pos < min_neg significa separador perfeito
+    neg = df[df[label_col]==0][c].dropna()
+    pos = df[df[label_col]==1][c].dropna()
+    if len(neg) == 0 or len(pos) == 0:
+        continue
+    if neg.max() < pos.min() or pos.max() < neg.min():
+        leaky.append(c)
+
+if leaky:
+    print("Removendo features que reproduzem o label (vazamento):", leaky)
+    for c in leaky:
+        if c in selected_features:
+            selected_features.remove(c)
+            X_train.drop(columns=[c], inplace=True, errors=True)
+            X_val.drop(columns=[c], inplace=True, errors=True)
 
 # ------------- LightGBM training (compatible with >=4.0) -------------
 lgb_train = lgb.Dataset(X_train, label=y_train)
@@ -212,3 +246,18 @@ with open(features_path, "w", encoding="utf8") as f:
 print("\nSaved model to:", model_path)
 print("Saved feature list to:", features_path)
 print("Best iteration:", getattr(bst, "best_iteration", None))
+
+import numpy as np
+from sklearn.metrics import precision_recall_curve, f1_score
+
+probs = bst.predict(X_val)
+prec, rec, thr = precision_recall_curve(y_val, probs)
+f1s = 2 * prec * rec / (prec + rec + 1e-12)
+best_idx = np.nanargmax(f1s)
+best_thr = thr[best_idx] if best_idx < len(thr) else 0.5
+print(f"Melhor F1={f1s[best_idx]:.3f} com cutoff={best_thr:.2f}")
+
+y_pred_best = (probs >= best_thr).astype(int)
+print("Confusion matrix no melhor cutoff:")
+from sklearn.metrics import confusion_matrix
+print(confusion_matrix(y_val, y_pred_best))

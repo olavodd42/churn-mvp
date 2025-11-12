@@ -1,0 +1,9 @@
+[
+  "num_orders_7d",
+  "num_orders_30d",
+  "avg_order_value_7d",
+  "avg_order_value_30d",
+  "days_since_last_order",
+  "pct_active_60d",
+  "avg_order_value"
+]

@@ -1,0 +1,10 @@
+project: churn_mvp
+registry: registry.db
+provider: local
+
+# Online store em SQLite (arquivo local)
+online_store:
+  type: sqlite
+  path: data/online_store.db
+
+# NOTE: não declarar offline_store.path aqui — deixe o FileSource apontar diretamente para seus parquet

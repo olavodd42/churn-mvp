@@ -22,7 +22,7 @@ RANDOM_STATE = 42
 
 # Paths
 repo_root = Path(__file__).resolve().parent.parent
-data_path = repo_root / "data" / "training_dataset.parquet"
+data_path = repo_root / "data" / "training_dataset_penult.parquet"
 model_dir = repo_root / "model" / "artifacts"
 model_dir.mkdir(parents=True, exist_ok=True)
 model_path = model_dir / "churn_baseline_v2.pkl"

@@ -1,227 +1,181 @@
-# model/build_training_dataset.py
+#!/usr/bin/env python3
 """
-Gera o dataset de treino com features derivadas (recência, frequência, média de valor, pct dias ativos)
-e combina com features do Feast. Sem vazamento: todas as janelas usam eventos estritamente
-anteriores ao label timestamp (event_timestamp).
+model/build_training_dataset.py  (corrigido + debug-friendly)
 
-Rode:
-    .venv\Scripts\Activate
-    python model\build_training_dataset.py
+Gera data/training_dataset.parquet incluindo as colunas:
+ - next_purchase_ts
+ - days_to_next
+
+Rótulo temporal:
+ - label = 1 (churn) se next_purchase is NaT OR days_to_next > churn_window_days
+ - label = 0 (not churn) se next_purchase existe e days_to_next <= churn_window_days
 """
-
+from pathlib import Path
+import json
 import pandas as pd
 import numpy as np
-from pathlib import Path
-from datetime import timedelta
-from feast import FeatureStore
+import pyarrow as pa
+import pyarrow.parquet as pq
+from typing import List
 
-# ------------------ PATHS ------------------
-repo_root = Path(__file__).resolve().parent.parent
-data_dir = repo_root / "data"
-user_features_path = data_dir / "user_features.parquet"
-events_path = data_dir / "events.parquet"              # eventos brutos recomendados
-output_path = data_dir / "training_dataset.parquet"
-feature_repo_path = repo_root / "feature_repo"
+ROOT = Path(__file__).resolve().parent.parent
+USER_FEAT = ROOT / "data" / "user_features_v3.parquet"
+EVENTS = ROOT / "data" / "events.parquet"
+OUT = ROOT / "data" / "training_dataset.parquet"
+META_OUT = ROOT / "data" / "training_dataset_meta.json"
+FEATURE_LIST = ROOT / "model" / "artifacts" / "feature_list_v2.json"
 
-# ------- checagem de arquivos mínimos -------
-if not user_features_path.exists():
-    raise SystemExit(f"Arquivo não encontrado: {user_features_path}. Gere com scripts/prepare_user_features.py")
+CHURN_WINDOW_DAYS = 30
 
-# carrega snapshot / agregados por usuário (fallback)
-df_users = pd.read_parquet(user_features_path)
-print("Loaded user_features:", user_features_path, "shape:", df_users.shape)
-print("Columns:", df_users.columns.tolist())
+def load_user_features(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise SystemExit(f"user features não encontrado: {path}")
+    df = pd.read_parquet(path)
+    if "as_of_ts" not in df.columns:
+        raise SystemExit("user_features_v3 não tem coluna 'as_of_ts'")
+    df["as_of_ts"] = pd.to_datetime(df["as_of_ts"], utc=True, errors="coerce")
+    if df["as_of_ts"].isna().any():
+        n = int(df["as_of_ts"].isna().sum())
+        print(f"Warning: {n} rows with NaT as_of_ts (dropping)")
+        df = df[df["as_of_ts"].notna()].copy()
+    return df
 
-# escolhe coluna de timestamp no snapshot
-ts_col = "event_ts" if "event_ts" in df_users.columns else ("last_order_ts" if "last_order_ts" in df_users.columns else None)
-if ts_col is None:
-    raise SystemExit("Nenhuma coluna de timestamp encontrada em user_features.parquet (procure por 'event_ts' ou 'last_order_ts').")
-print("Using snapshot timestamp column:", ts_col)
+def load_events(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise SystemExit(f"events não encontrado: {path}")
+    ev = pd.read_parquet(path)
+    # normalize ts column names
+    if "event_ts" not in ev.columns and "ts" in ev.columns:
+        ev = ev.rename(columns={"ts": "event_ts"})
+    ev["event_ts"] = pd.to_datetime(ev["event_ts"], utc=True, errors="coerce")
+    if ev["event_ts"].isna().any():
+        n = int(ev["event_ts"].isna().sum())
+        print(f"Warning: {n} events have NaT event_ts -> dropping those rows")
+        ev = ev[ev["event_ts"].notna()].copy()
+    if "user_id" not in ev.columns:
+        raise SystemExit("events.parquet precisa conter 'user_id'")
+    ev["user_id"] = ev["user_id"].astype(int)
+    if "is_purchase" not in ev.columns:
+        ev["is_purchase"] = (~ev.get("order_value", pd.Series(dtype=float)).isna()).astype(int)
+    ev["is_purchase"] = ev["is_purchase"].astype(int)
+    return ev
 
-# tenta carregar events.parquet (fonte ideal para janelas)
-use_events = False
-if events_path.exists():
-    events = pd.read_parquet(events_path)
-    # normaliza nomes
-    if "event_ts" not in events.columns and "timestamp" in events.columns:
-        events = events.rename(columns={"timestamp": "event_ts"})
-    if "event_ts" not in events.columns:
-        raise SystemExit("events.parquet encontrado mas não contém coluna 'event_ts' nem 'timestamp'.")
-    events["event_ts"] = pd.to_datetime(events["event_ts"], utc=True)
-    # garantir colunas mínimas (user_id, event_ts). order_value and is_purchase são opcionais mas usados se existirem.
-    if "user_id" not in events.columns:
-        raise SystemExit("events.parquet precisa conter coluna 'user_id'.")
-    print("Using events.parquet for windowed aggregations. Events shape:", events.shape)
-    use_events = True
-else:
-    events = None
-    print("events.parquet not found — falling back to snapshot history for approximations.")
-
-# ------------------ MONTAR entity_df ------------------
-# Amostra de usuários (se quiser usar todos, remova sample logic)
-sample_size = 1000
-unique_users = df_users["user_id"].drop_duplicates()
-n_to_sample = min(sample_size, unique_users.nunique())
-sample_users = unique_users.sample(n_to_sample, random_state=42).tolist()
-
-entity_rows = []
-for uid in sample_users:
-    sub = df_users[df_users["user_id"] == uid]
-    if sub.empty:
-        continue
-    label_ts = pd.to_datetime(sub[ts_col].max())  # último snapshot timestamp para aquele user
-    entity_rows.append({"user_id": int(uid), "event_timestamp": label_ts})
-
-entity_df = pd.DataFrame(entity_rows)
-print("entity_df sample:", entity_df.head())
-
-# ------------------ FUNÇÃO DE JANELAS (sem vazamento) ------------------
-def compute_window_features_for_row(uid, label_ts, events_df, snapshot_df):
+def compute_next_purchase(events: pd.DataFrame, user_feats: pd.DataFrame) -> pd.DataFrame:
     """
-    Retorna dict com features calculadas somente com eventos < label_ts.
-    janelas: 7d, 30d, 60d. Se não houver events_df, usa snapshot_df como fallback.
+    Para cada user (as_of_ts) encontra the next purchase ts (min event_ts > as_of_ts).
+    Retorna DataFrame user_id, as_of_ts, next_purchase_ts, days_to_next (float days, NaN if none).
     """
-    res = {}
-    windows = {"7d": 7, "30d": 30, "60d": 60}
+    purchases = events[events["is_purchase"] == 1].copy()
+    # join user as_of to purchases on user_id: keep all users (right join)
+    merged = user_feats[["user_id","as_of_ts"]].merge(
+        purchases[["user_id","event_ts"]], on="user_id", how="left", suffixes=("","_purchase")
+    )
+    # keep only purchases after as_of_ts
+    mask_after = (merged["event_ts"].notna()) & (merged["event_ts"] > merged["as_of_ts"])
+    merged_after = merged[mask_after].copy()
+    if merged_after.empty:
+        out = user_feats[["user_id","as_of_ts"]].copy()
+        out["next_purchase_ts"] = pd.NaT
+        out["days_to_next"] = np.nan
+        return out
+    # compute min event_ts per user
+    next_per_user = merged_after.groupby("user_id", sort=False)["event_ts"].min().rename("next_purchase_ts").reset_index()
+    out = user_feats[["user_id","as_of_ts"]].merge(next_per_user, on="user_id", how="left")
+    out["days_to_next"] = (out["next_purchase_ts"] - out["as_of_ts"]).dt.total_seconds() / 86400.0
+    return out
 
-    if events_df is not None:
-        user_ev = events_df[events_df["user_id"] == uid].sort_values("event_ts")
-        prev = user_ev[user_ev["event_ts"] < label_ts]
+def build_training_dataset(user_feats: pd.DataFrame, next_df: pd.DataFrame, churn_window_days: int) -> pd.DataFrame:
+    df = user_feats.merge(next_df[["user_id","next_purchase_ts","days_to_next"]], on="user_id", how="left")
+    # label: churn=1 if no next purchase in window
+    df["label"] = ((df["days_to_next"].isna()) | (df["days_to_next"] > float(churn_window_days))).astype(int)
+    return df
 
-        if prev.shape[0] == 0:
-            res["last_order_ts"] = pd.NaT
-            res["days_since_last_order"] = np.nan
-        else:
-            last = prev["event_ts"].max()
-            res["last_order_ts"] = last
-            res["days_since_last_order"] = (label_ts - last).days
+def choose_features_for_model(df: pd.DataFrame) -> List[str]:
+    # Explicitly exclude debug cols so they don't get into the features list
+    exclude = {
+        "user_id",
+        "as_of_ts",
+        "last_order_ts",
+        "first_order_ts",
+        "next_purchase_ts",
+        "days_to_next",
+        "label",
+    }
+    cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c].dtype)]
+    # keep only non-constant
+    keep = [c for c in sorted(cols) if df[c].nunique(dropna=True) > 1]
+    return keep
 
-        for k, days in windows.items():
-            start = label_ts - pd.Timedelta(days=days)
-            window_df = prev[(prev["event_ts"] >= start) & (prev["event_ts"] < label_ts)]
-            # assumimos 'is_purchase' se houver, senão contamos linhas
-            if "is_purchase" in window_df.columns:
-                res[f"num_orders_{k}"] = int(window_df["is_purchase"].sum())
-            else:
-                res[f"num_orders_{k}"] = int(window_df.shape[0])
+def save_parquet(df: pd.DataFrame, path: Path):
+    table = pa.Table.from_pandas(df)
+    pq.write_table(table, path, compression="snappy")
+    print(f"Saved {path} ({df.shape[0]} rows, {df.shape[1]} cols)")
 
-            if "order_value" in window_df.columns and window_df.shape[0] > 0:
-                res[f"avg_order_value_{k}"] = float(window_df["order_value"].mean())
-            else:
-                res[f"avg_order_value_{k}"] = np.nan
+def main():
+    print("Loading user features...")
+    user_feats = load_user_features(USER_FEAT)
+    print("Loading events...")
+    events = load_events(EVENTS)
 
-        # pct dias ativos últimos 60 dias
-        last_60 = prev[(prev["event_ts"] >= label_ts - pd.Timedelta(days=60)) & (prev["event_ts"] < label_ts)]
-        if last_60.shape[0] > 0:
-            distinct_days = last_60["event_ts"].dt.floor("D").nunique()
-            res["pct_active_60d"] = distinct_days / 60.0
-        else:
-            res["pct_active_60d"] = 0.0
+    print("Computing next purchase per user (vectorized)...")
+    next_df = compute_next_purchase(events, user_feats)
+    n_no_next = int(next_df["next_purchase_ts"].isna().sum())
+    print(f"Users without next purchase after as_of: {n_no_next} / {len(next_df)}")
 
-    else:
-        # fallback using snapshots in snapshot_df; less precise but works
-        user_hist = snapshot_df[snapshot_df["user_id"] == uid].sort_values(ts_col)
-        prev = user_hist[user_hist[ts_col] < label_ts]
-        if prev.shape[0] == 0:
-            res["last_order_ts"] = pd.NaT
-            res["days_since_last_order"] = np.nan
-            res["num_orders_7d"] = 0
-            res["num_orders_30d"] = 0
-            res["avg_order_value_7d"] = np.nan
-            res["avg_order_value_30d"] = np.nan
-            res["pct_active_60d"] = 0.0
-        else:
-            last = pd.to_datetime(prev[ts_col].max())
-            res["last_order_ts"] = last
-            res["days_since_last_order"] = (label_ts - last).days
-            # use latest snapshot prior to label for approximate orders_30d / avg_value_30d
-            last_snap = prev.loc[prev[ts_col].idxmax()]
-            res["num_orders_30d"] = int(last_snap.get("orders_30d", 0))
-            res["avg_order_value_30d"] = float(last_snap.get("avg_order_value", np.nan))
-            # 7d approximations if available
-            res["num_orders_7d"] = int(last_snap.get("orders_7d", 0)) if "orders_7d" in prev.columns else 0
-            res["avg_order_value_7d"] = np.nan
-            res["pct_active_60d"] = 0.0
+    print(f"Building labels with churn window = {CHURN_WINDOW_DAYS} days...")
+    ds = build_training_dataset(user_feats, next_df, CHURN_WINDOW_DAYS)
 
-    return res
+    pos = int(ds["label"].sum())
+    neg = int((ds["label"]==0).sum())
+    print(f"Dataset rows: {len(ds)}  positives: {pos} negatives: {neg}")
 
-# ------------------ Calcular derived features para cada linha de entity_df ------------------
-derived_rows = []
-for _, row in entity_df.iterrows():
-    uid = int(row["user_id"])
-    label_ts = pd.to_datetime(row["event_timestamp"])
-    feats = compute_window_features_for_row(uid, label_ts, events if use_events else None, df_users)
-    feats["user_id"] = uid
-    feats["event_timestamp"] = label_ts
-    derived_rows.append(feats)
+    if pos == 0 or neg == 0:
+        print("WARNING: all labels identical — cheque a lógica de labeling ou seus eventos (possível falta de purchases after as_of).")
+        print("Sample head:", ds.head(10).to_dict(orient='records'))
 
-derived_df = pd.DataFrame(derived_rows)
-# garantir colunas esperadas
-expected_cols = [
-    "user_id", "event_timestamp", "days_since_last_order", "last_order_ts",
-    "num_orders_7d", "num_orders_30d",
-    "avg_order_value_7d", "avg_order_value_30d",
-    "pct_active_60d"
-]
-for c in expected_cols:
-    if c not in derived_df.columns:
-        derived_df[c] = np.nan
+    # choose features
+    features = choose_features_for_model(ds)
+    if not features:
+        raise SystemExit("Nenhuma feature numérica útil detectada. Verifique user_features_v3.")
+    print("Using features:", features)
 
-print("Derived features sample:\n", derived_df.head())
+    # FINAL: include next_purchase_ts and days_to_next for debugging / validation
+    # ensure we don't duplicate columns (defensive)
+    debug_cols = ["next_purchase_ts", "days_to_next", "label"]
+    final_cols = ["user_id","as_of_ts"] + [f for f in features if f not in debug_cols] + debug_cols
+    # defensive: preserve order and remove duplicates if any
+    seen = set()
+    final_cols_unique = []
+    for c in final_cols:
+        if c not in seen:
+            final_cols_unique.append(c)
+            seen.add(c)
 
-# ------------------ Puxar features históricas do Feast e juntar ------------------
-fs = FeatureStore(repo_path=str(feature_repo_path))
-feature_list = [
-    "user_stats:orders_30d",
-    "user_stats:avg_order_value",
-    "user_stats:last_order_ts",
-]
-fs_df = fs.get_historical_features(entity_df=entity_df, features=feature_list).to_df()
-print("Feast returned columns:", fs_df.columns.tolist())
-# normalizar nomes se vier com prefixo
-rename_map = {}
-if "user_stats:orders_30d" in fs_df.columns:
-    rename_map["user_stats:orders_30d"] = "orders_30d"
-if "user_stats:avg_order_value" in fs_df.columns:
-    rename_map["user_stats:avg_order_value"] = "avg_order_value"
-if "user_stats:last_order_ts" in fs_df.columns:
-    rename_map["user_stats:last_order_ts"] = "last_order_ts_fs"
-if rename_map:
-    fs_df = fs_df.rename(columns=rename_map)
+    final = ds[final_cols_unique].copy()
+    final["label"] = final["label"].astype(int)
 
-# merge: alinha por user_id + event_timestamp
-full_df = pd.merge(fs_df, derived_df, how="left", on=["user_id", "event_timestamp"])
-full_df = full_df.drop_duplicates(subset=["user_id", "event_timestamp"], keep="last")
+    # save final dataset
+    out_path = OUT
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    save_parquet(final, out_path)
 
-# ------------------ LABEL (proxy) ------------------
-# Default: churn proxy = sem pedidos nos últimos 30 dias (usar num_orders_30d quando possível)
-if "label" not in full_df.columns:
-    source_for_orders = None
-    if "orders_30d" in full_df.columns:
-        source_for_orders = "orders_30d"
-    elif "num_orders_30d" in full_df.columns:
-        source_for_orders = "num_orders_30d"
+    # save feature list (without debug cols)
+    FEATURE_LIST.parent.mkdir(parents=True, exist_ok=True)
+    json.dump(features, open(FEATURE_LIST, "w"), indent=2)
+    print("Saved feature list to", FEATURE_LIST)
 
-    if source_for_orders:
-        full_df["label"] = (
-            (full_df["days_since_last_order"] > 60)  # sem compra há mais de 60 dias
-        ).astype(int)
-    else:
-        # fallback conservador: marca tudo como não-churn (0) para evitar vazamento
-        full_df["label"] = 0
-        print("Aviso: não foi possível inferir coluna de orders para gerar label. Labels preenchidos com 0 (ajuste a regra).")
+    # metadata
+    meta = {
+        "n_rows": int(len(final)),
+        "n_features": len(features),
+        "n_positive": pos,
+        "n_negative": neg,
+        "churn_window_days": CHURN_WINDOW_DAYS,
+        "created_by": "build_training_dataset.py"
+    }
+    Path(META_OUT).write_text(json.dumps(meta, indent=2, default=str))
+    print("Saved meta to", META_OUT)
+    print("Done. Dataset ready for model/train_baseline_v2.py")
 
-# ------------------ LIMPEZA DE TIPOS E SALVAMENTO ------------------
-# converter timestamps para timezone-aware e garantir tipos numéricos
-if "event_timestamp" in full_df.columns:
-    full_df["event_timestamp"] = pd.to_datetime(full_df["event_timestamp"], utc=True)
-if "last_order_ts" in full_df.columns:
-    full_df["last_order_ts"] = pd.to_datetime(full_df["last_order_ts"], utc=True)
-if "last_order_ts_fs" in full_df.columns:
-    full_df["last_order_ts_fs"] = pd.to_datetime(full_df["last_order_ts_fs"], utc=True)
-
-# salvar parquet final
-full_df.to_parquet(output_path, index=False)
-print("Saved training dataset with derived features to", output_path)
-print(full_df.head())
-print("Columns saved:", full_df.columns.tolist())
+if __name__ == "__main__":
+    main()
